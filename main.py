@@ -11,33 +11,64 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from groq import AsyncGroq
 
-# Configuration
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
+
 logger = logging.getLogger("psychomods_ai")
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
+
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v27.0")
 
-groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+# Select the host that matches your Meta login configuration.
+# Instagram Login: https://graph.instagram.com
+# Facebook Login:  https://graph.facebook.com
+META_GRAPH_BASE_URL = os.getenv(
+    "META_GRAPH_BASE_URL",
+    "https://graph.facebook.com",
+).rstrip("/")
+
+# Usually the Instagram professional account ID.
+# Leave empty to use entry.id from the webhook.
+INSTAGRAM_SEND_ID = os.getenv("INSTAGRAM_SEND_ID", "").strip()
+
+groq_client = (
+    AsyncGroq(api_key=GROQ_API_KEY)
+    if GROQ_API_KEY
+    else None
+)
 
 app = FastAPI(
     title="PSYCHOMODS AI",
-    description="AI-powered Instagram webhook assistant.",
-    version="0.2.0",
+    description="AI-powered Instagram DM assistant",
+    version="1.0.0",
 )
 
-# Basic in-memory duplicate protection.
-# This resets when the service restarts.
+# --------------------------------------------------
+# DUPLICATE MESSAGE PROTECTION
+# --------------------------------------------------
+
 seen_message_ids: set[str] = set()
 recent_message_ids: deque[str] = deque()
+
 MAX_SEEN_IDS = 5000
 
 
 def remember_message(message_id: str) -> bool:
+    if not message_id:
+        return False
+
     if message_id in seen_message_ids:
         return False
 
@@ -51,8 +82,15 @@ def remember_message(message_id: str) -> bool:
     return True
 
 
+# --------------------------------------------------
+# META SIGNATURE VALIDATION
+# --------------------------------------------------
+
 def verify_meta_signature(body: bytes, signature: str) -> bool:
-    if not META_APP_SECRET or not signature.startswith("sha256="):
+    if not META_APP_SECRET:
+        return False
+
+    if not signature.startswith("sha256="):
         return False
 
     expected = "sha256=" + hmac.new(
@@ -64,9 +102,13 @@ def verify_meta_signature(body: bytes, signature: str) -> bool:
     return hmac.compare_digest(signature, expected)
 
 
+# --------------------------------------------------
+# GROQ AI RESPONSE
+# --------------------------------------------------
+
 async def generate_ai_reply(user_message: str) -> str:
     if not groq_client:
-        raise RuntimeError("Groq is not configured")
+        raise RuntimeError("Groq API key is not configured")
 
     completion = await groq_client.chat.completions.create(
         model=GROQ_MODEL,
@@ -74,15 +116,16 @@ async def generate_ai_reply(user_message: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are the official Instagram assistant for PSYCHO MOD'S, "
-                    "a technology and cybersecurity brand. "
-                    "Write friendly, natural, professional and concise replies. "
-                    "Understand the user's question before answering. "
-                    "For cybersecurity topics, support ethical learning, "
+                    "You are the official Instagram AI assistant "
+                    "for PSYCHO MOD'S, a technology and cybersecurity brand. "
+                    "Be friendly, professional, helpful and concise. "
+                    "Use natural conversational language. "
+                    "Understand the question before answering. "
+                    "For cybersecurity, support ethical learning, "
                     "defensive security and authorized labs only. "
                     "Never help with credential theft, malware deployment, "
                     "unauthorized access or harming others. "
-                    "Never invent prices, products, services, links or company facts. "
+                    "Never invent prices, services, links or company facts. "
                     "If you do not know something, say so politely. "
                     "Keep replies suitable for Instagram DMs."
                 ),
@@ -97,24 +140,37 @@ async def generate_ai_reply(user_message: str) -> str:
     )
 
     reply = completion.choices[0].message.content
-    if not reply:
-        raise RuntimeError("Groq returned an empty reply")
+
+    if not reply or not reply.strip():
+        raise RuntimeError("Groq returned an empty response")
 
     return reply.strip()[:3000]
 
+
+# --------------------------------------------------
+# SEND INSTAGRAM DM
+# --------------------------------------------------
 
 async def send_instagram_dm(
     instagram_user_id: str,
     recipient_id: str,
     reply_text: str,
-) -> None:
+) -> bool:
+
     if not INSTAGRAM_ACCESS_TOKEN:
         logger.error("Instagram access token is not configured")
-        return
+        return False
+
+    account_id = INSTAGRAM_SEND_ID or instagram_user_id
+
+    if not account_id or not recipient_id:
+        logger.error("Missing Instagram account or recipient ID")
+        return False
 
     url = (
-        f"https://graph.facebook.com/{GRAPH_API_VERSION}/"
-        f"{instagram_user_id}/messages"
+        f"{META_GRAPH_BASE_URL}/"
+        f"{GRAPH_API_VERSION}/"
+        f"{account_id}/messages"
     )
 
     headers = {
@@ -123,66 +179,192 @@ async def send_instagram_dm(
     }
 
     payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": reply_text},
+        "recipient": {
+            "id": recipient_id,
+        },
+        "message": {
+            "text": reply_text[:1000],
+        },
     }
 
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 url,
                 headers=headers,
                 json=payload,
             )
-            response.raise_for_status()
 
-        logger.info("Instagram DM reply sent successfully")
+        if response.is_success:
+            logger.info("Instagram DM reply sent successfully")
+            return True
 
-    except httpx.HTTPStatusError as exc:
+        # Log the API error response, but never the access token.
         logger.error(
-            "Instagram send API returned HTTP %s",
-            exc.response.status_code,
+            "Instagram API error: HTTP %s; response=%s",
+            response.status_code,
+            response.text[:1000],
         )
-    except httpx.RequestError:
-        logger.error("Instagram send API network request failed")
 
+        return False
+
+    except httpx.RequestError as exc:
+        logger.error(
+            "Instagram API network error: %s",
+            type(exc).__name__,
+        )
+        return False
+
+
+# --------------------------------------------------
+# PROCESS ONE INCOMING MESSAGE
+# --------------------------------------------------
 
 async def process_dm(
     instagram_user_id: str,
     sender_id: str,
     message_text: str,
 ) -> None:
+
     try:
+        logger.info("Starting AI response generation")
+
         reply = await generate_ai_reply(message_text)
+
+        logger.info("AI response generated successfully")
+
         await send_instagram_dm(
             instagram_user_id,
             sender_id,
             reply,
         )
+
     except Exception as exc:
-        logger.error(
-            "DM processing failed (%s)",
+        logger.exception(
+            "DM processing failed: %s",
             type(exc).__name__,
         )
 
 
+# --------------------------------------------------
+# NORMALIZE INCOMING WEBHOOK EVENTS
+# --------------------------------------------------
+
+def extract_messaging_events(entry: dict[str, Any]) -> list[dict]:
+    """
+    Instagram DM notifications normally use entry.messaging[].
+    Other field-change notifications may use entry.changes[].
+    We inspect both without assuming every change is a DM.
+    """
+
+    events: list[dict] = []
+
+    messaging = entry.get("messaging", [])
+
+    if isinstance(messaging, list):
+        events.extend(
+            item for item in messaging
+            if isinstance(item, dict)
+        )
+
+    changes = entry.get("changes", [])
+
+    if isinstance(changes, list):
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+
+            field = change.get("field")
+            value = change.get("value")
+
+            if field not in ("messages", "messaging"):
+                continue
+
+            if not isinstance(value, dict):
+                continue
+
+            # Only accept change events that contain a usable
+            # messaging-style message structure.
+            if isinstance(value.get("message"), dict):
+                events.append(value)
+
+    return events
+
+
+def extract_incoming_message(
+    event: dict[str, Any],
+    account_id: str,
+) -> tuple[str, str, str] | None:
+
+    message = event.get("message")
+
+    if not isinstance(message, dict):
+        return None
+
+    if message.get("is_echo"):
+        return None
+
+    sender = event.get("sender") or {}
+    recipient = event.get("recipient") or {}
+
+    if not isinstance(sender, dict):
+        return None
+
+    if not isinstance(recipient, dict):
+        return None
+
+    sender_id = str(sender.get("id", ""))
+    recipient_id = str(recipient.get("id", ""))
+
+    message_text = message.get("text", "")
+    message_id = str(message.get("mid", ""))
+
+    if not isinstance(message_text, str):
+        return None
+
+    message_text = message_text.strip()
+
+    if not sender_id or not message_id or not message_text:
+        return None
+
+    if sender_id == account_id:
+        return None
+
+    # The sender is the person who messaged your business account.
+    return sender_id, message_id, message_text
+
+
+# --------------------------------------------------
+# BASIC ROUTES
+# --------------------------------------------------
+
 @app.get("/")
-async def home() -> dict[str, str]:
+async def home():
     return {
         "project": "PSYCHOMODS AI",
         "status": "online",
         "service": "Instagram AI Assistant",
-        "docs": "/docs",
+        "version": "1.0.0",
     }
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "healthy"}
+async def health():
+    return {
+        "status": "healthy",
+        "groq_configured": groq_client is not None,
+        "instagram_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
+        "meta_app_secret_configured": bool(META_APP_SECRET),
+    }
 
+
+# --------------------------------------------------
+# META WEBHOOK VERIFICATION
+# --------------------------------------------------
 
 @app.get("/webhook", response_class=PlainTextResponse)
-async def verify_webhook(request: Request) -> PlainTextResponse:
+async def verify_webhook(request: Request):
+
     if not VERIFY_TOKEN:
         raise HTTPException(
             status_code=503,
@@ -199,104 +381,181 @@ async def verify_webhook(request: Request) -> PlainTextResponse:
         and hmac.compare_digest(token, VERIFY_TOKEN)
     ):
         logger.info("Meta webhook verification successful")
-        return PlainTextResponse(content=challenge or "")
 
-    raise HTTPException(status_code=403, detail="Verification failed")
+        return PlainTextResponse(
+            content=challenge or "",
+        )
 
+    raise HTTPException(
+        status_code=403,
+        detail="Webhook verification failed",
+    )
+
+
+# --------------------------------------------------
+# RECEIVE INSTAGRAM WEBHOOK
+# --------------------------------------------------
 
 @app.post("/webhook")
 async def receive_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
-) -> dict[str, str]:
+):
+
     if not META_APP_SECRET:
         raise HTTPException(
             status_code=503,
-            detail="Webhook signature validation is not configured",
+            detail="Meta App Secret is not configured",
         )
 
     body = await request.body()
-    signature = request.headers.get("X-Hub-Signature-256", "")
+
+    signature = request.headers.get(
+        "X-Hub-Signature-256",
+        "",
+    )
 
     if not verify_meta_signature(body, signature):
-        logger.warning("Rejected webhook with invalid signature")
+        logger.warning("Rejected webhook: invalid signature")
+
         raise HTTPException(
             status_code=401,
             detail="Invalid webhook signature",
         )
 
     try:
-        payload: Any = await request.json()
-    except Exception as exc:
+        payload = await request.json()
+
+    except Exception:
         raise HTTPException(
             status_code=400,
             detail="Invalid JSON payload",
-        ) from exc
+        )
 
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Invalid payload")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid webhook payload",
+        )
+
+    if payload.get("object") != "instagram":
+        logger.info(
+            "Ignoring webhook object type: %s",
+            payload.get("object"),
+        )
+
+        return {"status": "ignored"}
 
     entries = payload.get("entry", [])
-    scheduled = 0
 
-    if payload.get("object") == "instagram" and isinstance(entries, list):
-        for entry in entries:
-            if not isinstance(entry, dict):
+    if not isinstance(entries, list):
+        return {"status": "received"}
+
+    scheduled = 0
+    skipped = 0
+
+    for entry in entries:
+
+        if not isinstance(entry, dict):
+            continue
+
+        account_id = str(entry.get("id", ""))
+
+        events = extract_messaging_events(entry)
+
+        changes = entry.get("changes", [])
+
+        change_fields = [
+            item.get("field")
+            for item in changes
+            if isinstance(item, dict)
+        ] if isinstance(changes, list) else []
+
+        logger.info(
+            "Webhook diagnostic: entry_keys=%s messaging_count=%s "
+            "change_fields=%s",
+            sorted(entry.keys()),
+            len(entry.get("messaging", []))
+            if isinstance(entry.get("messaging", []), list)
+            else -1,
+            change_fields,
+        )
+
+        logger.info(
+            "Messaging events discovered: %d",
+            len(events),
+        )
+
+        for event in events:
+
+            message = event.get("message")
+
+            if not isinstance(message, dict):
+                skipped += 1
+                logger.info("Skipped event: no message object")
                 continue
 
-            instagram_user_id = str(entry.get("id", ""))
+            logger.info(
+                "Message diagnostic: event_keys=%s message_keys=%s "
+                "has_text=%s has_message_id=%s is_echo=%s",
+                sorted(event.keys()),
+                sorted(message.keys()),
+                bool(message.get("text")),
+                bool(message.get("mid")),
+                bool(message.get("is_echo")),
+            )
 
-            for event in entry.get("messaging", []):
-                if not isinstance(event, dict):
-                    continue
+            result = extract_incoming_message(
+                event,
+                account_id,
+            )
 
-                message = event.get("message", {})
-                if not isinstance(message, dict):
-                    continue
-
-                # Ignore messages sent by our own account.
-                if message.get("is_echo"):
-                    continue
-
-                sender_id = str(event.get("sender", {}).get("id", ""))
-                recipient_id = str(event.get("recipient", {}).get("id", ""))
-                message_text = message.get("text", "")
-                message_id = str(message.get("mid", ""))
-
-                account_id = instagram_user_id or recipient_id
-
-                if not (
-                    account_id
-                    and sender_id
-                    and message_text
-                    and message_id
-                ):
-                    continue
-
-                if sender_id == account_id:
-                    continue
-
-                if not remember_message(message_id):
-                    logger.info("Duplicate DM event ignored")
-                    continue
-
-                background_tasks.add_task(
-                    process_dm,
-                    account_id,
-                    sender_id,
-                    message_text,
+            if result is None:
+                skipped += 1
+                logger.info(
+                    "Skipped event: not a processable incoming text DM"
                 )
-                scheduled += 1
+                continue
 
-    # Never log private message contents or access tokens.
+            sender_id, message_id, message_text = result
+
+            if not account_id:
+                skipped += 1
+                logger.warning(
+                    "Skipped DM: Instagram account ID is missing"
+                )
+                continue
+
+            if not remember_message(message_id):
+                skipped += 1
+                logger.info("Duplicate DM event ignored")
+                continue
+
+            background_tasks.add_task(
+                process_dm,
+                account_id,
+                sender_id,
+                message_text,
+            )
+
+            scheduled += 1
+
     logger.info(
-        "Verified Instagram webhook received; entries=%d, DMs scheduled=%d",
-        len(entries) if isinstance(entries, list) else 0,
+        "Webhook completed: entries=%d, scheduled=%d, skipped=%d",
+        len(entries),
         scheduled,
+        skipped,
     )
 
-    return {"status": "received"}
+    return {
+        "status": "received",
+        "scheduled": str(scheduled),
+    }
 
+
+# --------------------------------------------------
+# LOCAL STARTUP
+# --------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
