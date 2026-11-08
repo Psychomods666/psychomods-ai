@@ -11,9 +11,9 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from groq import AsyncGroq
 
-# --------------------------------------------------
+# ==================================================
 # CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -27,45 +27,67 @@ META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_MODEL = os.getenv(
+    "GROQ_MODEL",
+    "openai/gpt-oss-20b"
+)
 
-GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v27.0")
+GRAPH_API_VERSION = os.getenv(
+    "GRAPH_API_VERSION",
+    "v27.0"
+)
 
-# Select the host that matches your Meta login configuration.
-# Instagram Login: https://graph.instagram.com
-# Facebook Login:  https://graph.facebook.com
+# Choose explicitly based on your Meta login configuration.
+API_MODE = os.getenv(
+    "INSTAGRAM_API_MODE",
+    "instagram_login"
+).lower().strip()
+
+API_HOSTS = {
+    "instagram_login": "https://graph.instagram.com",
+    "facebook_login": "https://graph.facebook.com",
+}
+
+if API_MODE not in API_HOSTS:
+    raise RuntimeError(
+        "INSTAGRAM_API_MODE must be instagram_login "
+        "or facebook_login"
+    )
+
 META_GRAPH_BASE_URL = os.getenv(
     "META_GRAPH_BASE_URL",
-    "https://graph.facebook.com",
+    API_HOSTS[API_MODE]
 ).rstrip("/")
 
-# Usually the Instagram professional account ID.
-# Leave empty to use entry.id from the webhook.
-INSTAGRAM_SEND_ID = os.getenv("INSTAGRAM_SEND_ID", "").strip()
+# Accept both variable names.
+INSTAGRAM_ACCOUNT_ID = (
+    os.getenv("INSTAGRAM_SENDER_ID", "").strip()
+    or os.getenv("INSTAGRAM_SEND_ID", "").strip()
+)
 
 groq_client = (
     AsyncGroq(api_key=GROQ_API_KEY)
-    if GROQ_API_KEY
-    else None
+    if GROQ_API_KEY else None
 )
 
 app = FastAPI(
     title="PSYCHOMODS AI",
     description="AI-powered Instagram DM assistant",
-    version="1.0.0",
+    version="2.0.0",
 )
 
-# --------------------------------------------------
+# ==================================================
 # DUPLICATE MESSAGE PROTECTION
-# --------------------------------------------------
+# ==================================================
 
-seen_message_ids: set[str] = set()
-recent_message_ids: deque[str] = deque()
+seen_message_ids = set()
+recent_message_ids = deque()
 
 MAX_SEEN_IDS = 5000
 
 
 def remember_message(message_id: str) -> bool:
+
     if not message_id:
         return False
 
@@ -76,17 +98,18 @@ def remember_message(message_id: str) -> bool:
     recent_message_ids.append(message_id)
 
     while len(recent_message_ids) > MAX_SEEN_IDS:
-        old_id = recent_message_ids.popleft()
-        seen_message_ids.discard(old_id)
+        old = recent_message_ids.popleft()
+        seen_message_ids.discard(old)
 
     return True
 
 
-# --------------------------------------------------
+# ==================================================
 # META SIGNATURE VALIDATION
-# --------------------------------------------------
+# ==================================================
 
 def verify_meta_signature(body: bytes, signature: str) -> bool:
+
     if not META_APP_SECRET:
         return False
 
@@ -94,21 +117,149 @@ def verify_meta_signature(body: bytes, signature: str) -> bool:
         return False
 
     expected = "sha256=" + hmac.new(
-        META_APP_SECRET.encode("utf-8"),
+        META_APP_SECRET.encode(),
         body,
         hashlib.sha256,
     ).hexdigest()
 
-    return hmac.compare_digest(signature, expected)
+    return hmac.compare_digest(expected, signature)
 
 
-# --------------------------------------------------
-# GROQ AI RESPONSE
-# --------------------------------------------------
+# ==================================================
+# API CONFIGURATION DIAGNOSTICS
+# ==================================================
 
-async def generate_ai_reply(user_message: str) -> str:
+@app.get("/diagnostics")
+async def diagnostics():
+
+    result = {
+        "project": "PSYCHOMODS AI",
+        "configured_mode": API_MODE,
+        "configured_host": META_GRAPH_BASE_URL,
+        "graph_version": GRAPH_API_VERSION,
+        "access_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
+        "groq_configured": groq_client is not None,
+        "app_secret_configured": bool(META_APP_SECRET),
+        "account_id_configured": bool(INSTAGRAM_ACCOUNT_ID),
+        "account_id_is_zero": INSTAGRAM_ACCOUNT_ID == "0",
+    }
+
+    if not INSTAGRAM_ACCESS_TOKEN:
+        result["error"] = "Instagram access token missing"
+        return result
+
+    # Test both hosts without exposing the token.
+    async with httpx.AsyncClient(timeout=20.0) as client:
+
+        for mode, host in API_HOSTS.items():
+
+            if mode == "instagram_login":
+                fields = "user_id,username"
+            else:
+                fields = "id,name"
+
+            url = (
+                f"{host}/{GRAPH_API_VERSION}/me"
+                f"?fields={fields}"
+            )
+
+            try:
+                response = await client.get(
+                    url,
+                    headers={
+                        "Authorization":
+                            f"Bearer {INSTAGRAM_ACCESS_TOKEN}"
+                    },
+                )
+
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = {}
+
+                result[mode] = {
+                    "http_status": response.status_code,
+                    "success": response.is_success,
+                    "identity": data if response.is_success else None,
+                    "error": (
+                        data.get("error", {}).get("message")
+                        if isinstance(data, dict)
+                        and isinstance(data.get("error"), dict)
+                        else None
+                    ),
+                }
+
+            except httpx.RequestError as exc:
+                result[mode] = {
+                    "success": False,
+                    "error": type(exc).__name__,
+                }
+
+    return result
+
+
+# ==================================================
+# CHECK ACCOUNT ID
+# ==================================================
+
+@app.get("/diagnostics/account")
+async def check_account():
+
+    if not INSTAGRAM_ACCESS_TOKEN:
+        raise HTTPException(503, "Access token missing")
+
+    if not INSTAGRAM_ACCOUNT_ID:
+        raise HTTPException(400, "Account ID missing")
+
+    if INSTAGRAM_ACCOUNT_ID == "0":
+        raise HTTPException(400, "Account ID cannot be zero")
+
+    url = (
+        f"{META_GRAPH_BASE_URL}/"
+        f"{GRAPH_API_VERSION}/"
+        f"{INSTAGRAM_ACCOUNT_ID}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+
+            response = await client.get(
+                url,
+                params={"fields": "id,username"},
+                headers={
+                    "Authorization":
+                        f"Bearer {INSTAGRAM_ACCESS_TOKEN}"
+                },
+            )
+
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+
+        return {
+            "configured_account_id": INSTAGRAM_ACCOUNT_ID,
+            "api_host": META_GRAPH_BASE_URL,
+            "http_status": response.status_code,
+            "success": response.is_success,
+            "result": data,
+        }
+
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            502,
+            f"Meta connection error: {type(exc).__name__}"
+        )
+
+
+# ==================================================
+# GROQ AI
+# ==================================================
+
+async def generate_ai_reply(message: str) -> str:
+
     if not groq_client:
-        raise RuntimeError("Groq API key is not configured")
+        raise RuntimeError("Groq API key missing")
 
     completion = await groq_client.chat.completions.create(
         model=GROQ_MODEL,
@@ -116,23 +267,18 @@ async def generate_ai_reply(user_message: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are the official Instagram AI assistant "
-                    "for PSYCHO MOD'S, a technology and cybersecurity brand. "
-                    "Be friendly, professional, helpful and concise. "
-                    "Use natural conversational language. "
-                    "Understand the question before answering. "
-                    "For cybersecurity, support ethical learning, "
-                    "defensive security and authorized labs only. "
-                    "Never help with credential theft, malware deployment, "
-                    "unauthorized access or harming others. "
-                    "Never invent prices, services, links or company facts. "
-                    "If you do not know something, say so politely. "
-                    "Keep replies suitable for Instagram DMs."
+                    "You are the official PSYCHO MOD'S Instagram "
+                    "AI assistant. Be friendly, professional, "
+                    "helpful and concise. Support ethical "
+                    "cybersecurity education and defensive security. "
+                    "Never assist unauthorized access, credential "
+                    "theft or malware deployment. Never invent "
+                    "company facts, prices or links."
                 ),
             },
             {
                 "role": "user",
-                "content": user_message[:3000],
+                "content": message[:3000],
             },
         ],
         temperature=0.5,
@@ -142,29 +288,31 @@ async def generate_ai_reply(user_message: str) -> str:
     reply = completion.choices[0].message.content
 
     if not reply or not reply.strip():
-        raise RuntimeError("Groq returned an empty response")
+        raise RuntimeError("Empty Groq response")
 
     return reply.strip()[:3000]
 
 
-# --------------------------------------------------
+# ==================================================
 # SEND INSTAGRAM DM
-# --------------------------------------------------
+# ==================================================
 
 async def send_instagram_dm(
-    instagram_user_id: str,
+    account_id: str,
     recipient_id: str,
     reply_text: str,
 ) -> bool:
 
     if not INSTAGRAM_ACCESS_TOKEN:
-        logger.error("Instagram access token is not configured")
+        logger.error("Instagram token missing")
         return False
 
-    account_id = INSTAGRAM_SEND_ID or instagram_user_id
+    if not account_id or account_id == "0":
+        logger.error("Invalid Instagram account ID")
+        return False
 
-    if not account_id or not recipient_id:
-        logger.error("Missing Instagram account or recipient ID")
+    if not recipient_id or recipient_id == "0":
+        logger.error("Invalid recipient ID")
         return False
 
     url = (
@@ -180,15 +328,16 @@ async def send_instagram_dm(
 
     payload = {
         "recipient": {
-            "id": recipient_id,
+            "id": recipient_id
         },
         "message": {
-            "text": reply_text[:1000],
+            "text": reply_text[:1000]
         },
     }
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
+
             response = await client.post(
                 url,
                 headers=headers,
@@ -196,10 +345,9 @@ async def send_instagram_dm(
             )
 
         if response.is_success:
-            logger.info("Instagram DM reply sent successfully")
+            logger.info("Instagram DM sent successfully")
             return True
 
-        # Log the API error response, but never the access token.
         logger.error(
             "Instagram API error: HTTP %s; response=%s",
             response.status_code,
@@ -210,21 +358,21 @@ async def send_instagram_dm(
 
     except httpx.RequestError as exc:
         logger.error(
-            "Instagram API network error: %s",
+            "Instagram network error: %s",
             type(exc).__name__,
         )
         return False
 
 
-# --------------------------------------------------
-# PROCESS ONE INCOMING MESSAGE
-# --------------------------------------------------
+# ==================================================
+# PROCESS INCOMING DM
+# ==================================================
 
 async def process_dm(
-    instagram_user_id: str,
+    account_id: str,
     sender_id: str,
     message_text: str,
-) -> None:
+):
 
     try:
         logger.info("Starting AI response generation")
@@ -234,7 +382,7 @@ async def process_dm(
         logger.info("AI response generated successfully")
 
         await send_instagram_dm(
-            instagram_user_id,
+            account_id,
             sender_id,
             reply,
         )
@@ -246,18 +394,13 @@ async def process_dm(
         )
 
 
-# --------------------------------------------------
-# NORMALIZE INCOMING WEBHOOK EVENTS
-# --------------------------------------------------
+# ==================================================
+# EXTRACT WEBHOOK EVENTS
+# ==================================================
 
-def extract_messaging_events(entry: dict[str, Any]) -> list[dict]:
-    """
-    Instagram DM notifications normally use entry.messaging[].
-    Other field-change notifications may use entry.changes[].
-    We inspect both without assuming every change is a DM.
-    """
+def extract_messaging_events(entry: dict[str, Any]):
 
-    events: list[dict] = []
+    events = []
 
     messaging = entry.get("messaging", [])
 
@@ -270,31 +413,30 @@ def extract_messaging_events(entry: dict[str, Any]) -> list[dict]:
     changes = entry.get("changes", [])
 
     if isinstance(changes, list):
+
         for change in changes:
+
             if not isinstance(change, dict):
                 continue
 
-            field = change.get("field")
+            if change.get("field") not in (
+                "messages",
+                "messaging"
+            ):
+                continue
+
             value = change.get("value")
 
-            if field not in ("messages", "messaging"):
-                continue
-
-            if not isinstance(value, dict):
-                continue
-
-            # Only accept change events that contain a usable
-            # messaging-style message structure.
-            if isinstance(value.get("message"), dict):
+            if (
+                isinstance(value, dict)
+                and isinstance(value.get("message"), dict)
+            ):
                 events.append(value)
 
     return events
 
 
-def extract_incoming_message(
-    event: dict[str, Any],
-    account_id: str,
-) -> tuple[str, str, str] | None:
+def extract_incoming_message(event: dict):
 
     message = event.get("message")
 
@@ -305,19 +447,13 @@ def extract_incoming_message(
         return None
 
     sender = event.get("sender") or {}
-    recipient = event.get("recipient") or {}
 
     if not isinstance(sender, dict):
         return None
 
-    if not isinstance(recipient, dict):
-        return None
-
     sender_id = str(sender.get("id", ""))
-    recipient_id = str(recipient.get("id", ""))
-
-    message_text = message.get("text", "")
     message_id = str(message.get("mid", ""))
+    message_text = message.get("text", "")
 
     if not isinstance(message_text, str):
         return None
@@ -327,49 +463,43 @@ def extract_incoming_message(
     if not sender_id or not message_id or not message_text:
         return None
 
-    if sender_id == account_id:
-        return None
-
-    # The sender is the person who messaged your business account.
     return sender_id, message_id, message_text
 
 
-# --------------------------------------------------
-# BASIC ROUTES
-# --------------------------------------------------
+# ==================================================
+# HOME AND HEALTH
+# ==================================================
 
 @app.get("/")
 async def home():
+
     return {
         "project": "PSYCHOMODS AI",
         "status": "online",
-        "service": "Instagram AI Assistant",
-        "version": "1.0.0",
+        "version": "2.0.0",
     }
 
 
 @app.get("/health")
 async def health():
+
     return {
         "status": "healthy",
         "groq_configured": groq_client is not None,
-        "instagram_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
-        "meta_app_secret_configured": bool(META_APP_SECRET),
+        "instagram_token_configured":
+            bool(INSTAGRAM_ACCESS_TOKEN),
+        "account_id_configured":
+            bool(INSTAGRAM_ACCOUNT_ID),
+        "api_mode": API_MODE,
     }
 
 
-# --------------------------------------------------
+# ==================================================
 # META WEBHOOK VERIFICATION
-# --------------------------------------------------
+# ==================================================
 
 @app.get("/webhook", response_class=PlainTextResponse)
 async def verify_webhook(request: Request):
-
-    if not VERIFY_TOKEN:
-        raise HTTPException(
-            status_code=503,
-            detail="Webhook verification is not configured",
-        )
 
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
@@ -377,24 +507,19 @@ async def verify_webhook(request: Request):
 
     if (
         mode == "subscribe"
+        and VERIFY_TOKEN
         and token
         and hmac.compare_digest(token, VERIFY_TOKEN)
     ):
-        logger.info("Meta webhook verification successful")
+        logger.info("Webhook verification successful")
+        return PlainTextResponse(challenge or "")
 
-        return PlainTextResponse(
-            content=challenge or "",
-        )
-
-    raise HTTPException(
-        status_code=403,
-        detail="Webhook verification failed",
-    )
+    raise HTTPException(403, "Webhook verification failed")
 
 
-# --------------------------------------------------
+# ==================================================
 # RECEIVE INSTAGRAM WEBHOOK
-# --------------------------------------------------
+# ==================================================
 
 @app.post("/webhook")
 async def receive_webhook(
@@ -403,10 +528,7 @@ async def receive_webhook(
 ):
 
     if not META_APP_SECRET:
-        raise HTTPException(
-            status_code=503,
-            detail="Meta App Secret is not configured",
-        )
+        raise HTTPException(503, "Meta App Secret missing")
 
     body = await request.body()
 
@@ -416,34 +538,17 @@ async def receive_webhook(
     )
 
     if not verify_meta_signature(body, signature):
-        logger.warning("Rejected webhook: invalid signature")
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid webhook signature",
-        )
+        raise HTTPException(401, "Invalid webhook signature")
 
     try:
         payload = await request.json()
-
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid JSON payload",
-        )
+        raise HTTPException(400, "Invalid JSON")
 
     if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid webhook payload",
-        )
+        raise HTTPException(400, "Invalid payload")
 
     if payload.get("object") != "instagram":
-        logger.info(
-            "Ignoring webhook object type: %s",
-            payload.get("object"),
-        )
-
         return {"status": "ignored"}
 
     entries = payload.get("entry", [])
@@ -459,76 +564,47 @@ async def receive_webhook(
         if not isinstance(entry, dict):
             continue
 
-        account_id = str(entry.get("id", ""))
+        # Actual Instagram professional account ID from webhook.
+        webhook_account_id = str(entry.get("id", "")).strip()
+
+        # Manual configured ID takes precedence if valid.
+        account_id = (
+            INSTAGRAM_ACCOUNT_ID
+            if INSTAGRAM_ACCOUNT_ID
+            else webhook_account_id
+        )
+
+        logger.info(
+            "Webhook account ID present=%s; configured ID present=%s",
+            bool(webhook_account_id),
+            bool(INSTAGRAM_ACCOUNT_ID),
+        )
+
+        if not account_id or account_id == "0":
+            logger.error("Invalid account ID; skipping entry")
+            skipped += 1
+            continue
 
         events = extract_messaging_events(entry)
 
-        changes = entry.get("changes", [])
-
-        change_fields = [
-            item.get("field")
-            for item in changes
-            if isinstance(item, dict)
-        ] if isinstance(changes, list) else []
-
-        logger.info(
-            "Webhook diagnostic: entry_keys=%s messaging_count=%s "
-            "change_fields=%s",
-            sorted(entry.keys()),
-            len(entry.get("messaging", []))
-            if isinstance(entry.get("messaging", []), list)
-            else -1,
-            change_fields,
-        )
-
-        logger.info(
-            "Messaging events discovered: %d",
-            len(events),
-        )
+        logger.info("Messaging events discovered: %d", len(events))
 
         for event in events:
 
-            message = event.get("message")
-
-            if not isinstance(message, dict):
-                skipped += 1
-                logger.info("Skipped event: no message object")
-                continue
-
-            logger.info(
-                "Message diagnostic: event_keys=%s message_keys=%s "
-                "has_text=%s has_message_id=%s is_echo=%s",
-                sorted(event.keys()),
-                sorted(message.keys()),
-                bool(message.get("text")),
-                bool(message.get("mid")),
-                bool(message.get("is_echo")),
-            )
-
-            result = extract_incoming_message(
-                event,
-                account_id,
-            )
+            result = extract_incoming_message(event)
 
             if result is None:
                 skipped += 1
-                logger.info(
-                    "Skipped event: not a processable incoming text DM"
-                )
                 continue
 
             sender_id, message_id, message_text = result
 
-            if not account_id:
+            if sender_id == account_id:
                 skipped += 1
-                logger.warning(
-                    "Skipped DM: Instagram account ID is missing"
-                )
                 continue
 
             if not remember_message(message_id):
                 skipped += 1
-                logger.info("Duplicate DM event ignored")
                 continue
 
             background_tasks.add_task(
@@ -541,27 +617,38 @@ async def receive_webhook(
             scheduled += 1
 
     logger.info(
-        "Webhook completed: entries=%d, scheduled=%d, skipped=%d",
-        len(entries),
+        "Webhook completed: scheduled=%d skipped=%d",
         scheduled,
         skipped,
     )
 
     return {
         "status": "received",
-        "scheduled": str(scheduled),
+        "scheduled": scheduled,
+        "skipped": skipped,
     }
 
 
-# --------------------------------------------------
-# LOCAL STARTUP
-# --------------------------------------------------
+# ==================================================
+# STARTUP
+# ==================================================
+
+@app.on_event("startup")
+async def startup():
+
+    logger.info("PSYCHOMODS AI starting")
+    logger.info("API mode: %s", API_MODE)
+    logger.info("API host: %s", META_GRAPH_BASE_URL)
+    logger.info("Account ID configured: %s", bool(INSTAGRAM_ACCOUNT_ID))
+    logger.info("Groq configured: %s", bool(groq_client))
+
 
 if __name__ == "__main__":
+
     import uvicorn
 
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),
     )
