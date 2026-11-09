@@ -27,7 +27,6 @@ logger = logging.getLogger("psychomods_ai")
 
 
 def clean_env(name: str) -> str:
-    """Read environment variables without surrounding quotes."""
     value = os.getenv(name, "").strip()
 
     if len(value) >= 2:
@@ -79,7 +78,7 @@ groq_client = (
 app = FastAPI(
     title="PSYCHOMODS AI",
     description="AI-powered Instagram DM assistant",
-    version="2.3.0",
+    version="2.3.1",
 )
 
 
@@ -115,11 +114,6 @@ def remember_message(message_id: str) -> bool:
 # ==================================================
 
 def get_signature_secrets() -> list[tuple[str, str]]:
-    """
-    Return configured candidate secrets.
-    Secret values are never logged or returned.
-    """
-
     candidates = []
 
     if META_APP_SECRET:
@@ -143,10 +137,6 @@ def verify_meta_signature(
     body: bytes,
     signature: str,
 ) -> tuple[bool, str]:
-    """
-    Verify Meta's X-Hub-Signature-256 header.
-    Uses the exact original request body bytes.
-    """
 
     if not signature:
         return False, "missing_header"
@@ -191,7 +181,7 @@ async def home():
     return {
         "project": "PSYCHOMODS AI",
         "status": "online",
-        "version": "2.3.0",
+        "version": "2.3.1",
     }
 
 
@@ -204,7 +194,7 @@ async def home_head():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "groq_configured": groq_client is not None,
         "instagram_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
         "account_id_configured": bool(INSTAGRAM_ACCOUNT_ID),
@@ -216,7 +206,7 @@ async def health():
 async def diagnostics():
     return {
         "project": "PSYCHOMODS AI",
-        "version": "2.3.0",
+        "version": "2.3.1",
         "configured_mode": API_MODE,
         "configured_host": META_GRAPH_BASE_URL,
         "graph_version": GRAPH_API_VERSION,
@@ -527,7 +517,6 @@ async def receive_webhook(
     background_tasks: BackgroundTasks,
 ):
 
-    # Read the exact original body before parsing JSON.
     body = await request.body()
 
     signature = request.headers.get(
@@ -550,10 +539,6 @@ async def receive_webhook(
         )
 
     valid, result = verify_meta_signature(body, signature)
-
-    # ==================================================
-    # SAFE SIGNATURE DIAGNOSTICS
-    # ==================================================
 
     if not valid:
         logger.warning(
@@ -584,7 +569,6 @@ async def receive_webhook(
         result,
     )
 
-    # Parse JSON only after signature validation.
     try:
         payload = json.loads(body)
 
@@ -649,7 +633,23 @@ async def receive_webhook(
 
             sender_id, message_id, message_text = message_result
 
+            # SAFE RECIPIENT ID DIAGNOSTICS
+            logger.info(
+                "DM RECIPIENT CHECK | "
+                "sender_id_last4=%s | "
+                "sender_id_length=%d | "
+                "account_id_last4=%s | "
+                "account_id_length=%d | "
+                "same_id=%s",
+                sender_id[-4:],
+                len(sender_id),
+                account_id[-4:],
+                len(account_id),
+                sender_id == account_id,
+            )
+
             if sender_id == account_id:
+                logger.info("Own account message ignored")
                 skipped += 1
                 continue
 
@@ -690,7 +690,7 @@ async def receive_webhook(
 async def startup():
 
     logger.info("PSYCHOMODS AI starting")
-    logger.info("Version: 2.3.0")
+    logger.info("Version: 2.3.1")
     logger.info("API mode: %s", API_MODE)
     logger.info("API host: %s", META_GRAPH_BASE_URL)
 
