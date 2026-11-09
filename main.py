@@ -1,6 +1,7 @@
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -21,20 +22,40 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
 )
+
 logger = logging.getLogger("psychomods_ai")
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "").strip()
-META_APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
-INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+def clean_env(name: str) -> str:
+    """Read an environment variable without accidental surrounding quotes."""
+    value = os.getenv(name, "").strip()
 
-GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v27.0").strip()
+    if len(value) >= 2:
+        if value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1].strip()
 
-API_MODE = os.getenv(
-    "INSTAGRAM_API_MODE", "instagram_login"
-).lower().strip()
+    return value
+
+
+VERIFY_TOKEN = clean_env("VERIFY_TOKEN")
+
+# Main Meta App Secret.
+META_APP_SECRET = clean_env("META_APP_SECRET")
+
+# Optional additional secret, only if Meta provides a separate
+# Instagram-specific secret for your integration.
+INSTAGRAM_APP_SECRET = clean_env("INSTAGRAM_APP_SECRET")
+
+INSTAGRAM_ACCESS_TOKEN = clean_env("INSTAGRAM_ACCESS_TOKEN")
+
+GROQ_API_KEY = clean_env("GROQ_API_KEY")
+GROQ_MODEL = clean_env("GROQ_MODEL") or "openai/gpt-oss-20b"
+
+GRAPH_API_VERSION = clean_env("GRAPH_API_VERSION") or "v27.0"
+
+API_MODE = (
+    clean_env("INSTAGRAM_API_MODE") or "instagram_login"
+).lower()
 
 API_HOSTS = {
     "instagram_login": "https://graph.instagram.com",
@@ -46,21 +67,25 @@ if API_MODE not in API_HOSTS:
         "INSTAGRAM_API_MODE must be instagram_login or facebook_login"
     )
 
-META_GRAPH_BASE_URL = os.getenv(
-    "META_GRAPH_BASE_URL", API_HOSTS[API_MODE]
+META_GRAPH_BASE_URL = (
+    clean_env("META_GRAPH_BASE_URL") or API_HOSTS[API_MODE]
 ).rstrip("/")
 
 INSTAGRAM_ACCOUNT_ID = (
-    os.getenv("INSTAGRAM_SENDER_ID", "").strip()
-    or os.getenv("INSTAGRAM_SEND_ID", "").strip()
+    clean_env("INSTAGRAM_SENDER_ID")
+    or clean_env("INSTAGRAM_SEND_ID")
 )
 
-groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+groq_client = (
+    AsyncGroq(api_key=GROQ_API_KEY)
+    if GROQ_API_KEY
+    else None
+)
 
 app = FastAPI(
     title="PSYCHOMODS AI",
     description="AI-powered Instagram DM assistant",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 
@@ -70,6 +95,7 @@ app = FastAPI(
 
 seen_message_ids = set()
 recent_message_ids = deque()
+
 MAX_SEEN_IDS = 5000
 
 
@@ -94,55 +120,127 @@ def remember_message(message_id: str) -> bool:
 # META WEBHOOK SIGNATURE VALIDATION
 # ==================================================
 
-def verify_meta_signature(body: bytes, signature: str) -> bool:
+def get_signature_secrets() -> list[tuple[str, str]]:
     """
-    Meta signs the exact raw request body using HMAC-SHA256
-    and the Meta App Secret.
+    Return configured candidate secrets.
 
-    Expected header format:
-    X-Hub-Signature-256: sha256=<64 hexadecimal characters>
+    The secret name is included for safe diagnostics.
+    Secret values are never logged or returned.
     """
 
-    if not META_APP_SECRET or not signature:
-        return False
+    candidates = []
+
+    if META_APP_SECRET:
+        candidates.append(
+            ("META_APP_SECRET", META_APP_SECRET)
+        )
+
+    if INSTAGRAM_APP_SECRET:
+        candidates.append(
+            ("INSTAGRAM_APP_SECRET", INSTAGRAM_APP_SECRET)
+        )
+
+    # Avoid checking the same value twice.
+    unique = []
+    seen = set()
+
+    for name, secret in candidates:
+        if secret not in seen:
+            seen.add(secret)
+            unique.append((name, secret))
+
+    return unique
+
+
+def verify_meta_signature(
+    body: bytes,
+    signature: str,
+) -> tuple[bool, str]:
+    """
+    Verify Meta's X-Hub-Signature-256 header.
+
+    HMAC-SHA256 is calculated over the exact raw request bytes.
+    No JSON parsing or body modification happens before validation.
+    """
+
+    if not signature:
+        return False, "missing_header"
 
     signature = signature.strip()
 
     if not signature.startswith("sha256="):
-        return False
+        return False, "invalid_header_format"
 
     received_digest = signature[len("sha256="):]
 
     if not re.fullmatch(r"[0-9a-fA-F]{64}", received_digest):
-        return False
+        return False, "invalid_digest_format"
 
-    expected_digest = hmac.new(
-        META_APP_SECRET.encode("utf-8"),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
+    secrets = get_signature_secrets()
 
-    return hmac.compare_digest(
-        expected_digest.lower(),
-        received_digest.lower(),
-    )
+    if not secrets:
+        return False, "no_secret_configured"
+
+    for secret_name, secret_value in secrets:
+
+        expected_digest = hmac.new(
+            secret_value.encode("utf-8"),
+            body,
+            hashlib.sha256,
+        ).hexdigest()
+
+        if hmac.compare_digest(
+            expected_digest,
+            received_digest.lower(),
+        ):
+            return True, secret_name
+
+    return False, "digest_mismatch"
 
 
 # ==================================================
 # DIAGNOSTICS
 # ==================================================
 
+@app.get("/")
+async def home():
+    return {
+        "project": "PSYCHOMODS AI",
+        "status": "online",
+        "version": "2.2.0",
+    }
+
+
+@app.head("/")
+async def home_head():
+    return PlainTextResponse("", status_code=200)
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "healthy",
+        "version": "2.2.0",
+        "groq_configured": groq_client is not None,
+        "instagram_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
+        "account_id_configured": bool(INSTAGRAM_ACCOUNT_ID),
+        "api_mode": API_MODE,
+    }
+
+
 @app.get("/diagnostics")
 async def diagnostics():
     return {
         "project": "PSYCHOMODS AI",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "configured_mode": API_MODE,
         "configured_host": META_GRAPH_BASE_URL,
         "graph_version": GRAPH_API_VERSION,
         "access_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
         "groq_configured": groq_client is not None,
-        "app_secret_configured": bool(META_APP_SECRET),
+        "meta_app_secret_configured": bool(META_APP_SECRET),
+        "instagram_app_secret_configured": bool(INSTAGRAM_APP_SECRET),
+        "signature_secret_count": len(get_signature_secrets()),
         "verify_token_configured": bool(VERIFY_TOKEN),
         "account_id_configured": bool(INSTAGRAM_ACCOUNT_ID),
         "account_id_is_zero": INSTAGRAM_ACCOUNT_ID == "0",
@@ -151,11 +249,18 @@ async def diagnostics():
 
 @app.get("/diagnostics/account")
 async def check_account():
+
     if not INSTAGRAM_ACCESS_TOKEN:
-        raise HTTPException(503, "Instagram access token missing")
+        raise HTTPException(
+            503,
+            "Instagram access token missing",
+        )
 
     if not INSTAGRAM_ACCOUNT_ID or INSTAGRAM_ACCOUNT_ID == "0":
-        raise HTTPException(400, "Valid Instagram account ID missing")
+        raise HTTPException(
+            400,
+            "Valid Instagram account ID missing",
+        )
 
     url = (
         f"{META_GRAPH_BASE_URL}/"
@@ -169,16 +274,19 @@ async def check_account():
                 url,
                 params={"fields": "id,username"},
                 headers={
-                    "Authorization": f"Bearer {INSTAGRAM_ACCESS_TOKEN}"
+                    "Authorization": (
+                        f"Bearer {INSTAGRAM_ACCESS_TOKEN}"
+                    )
                 },
             )
 
         try:
             data = response.json()
         except ValueError:
-            data = {"error": "Meta returned a non-JSON response"}
+            data = {
+                "error": "Meta returned a non-JSON response"
+            }
 
-        # Never return the access token.
         return {
             "configured_account_id": INSTAGRAM_ACCOUNT_ID,
             "api_host": META_GRAPH_BASE_URL,
@@ -189,8 +297,10 @@ async def check_account():
 
     except httpx.RequestError as exc:
         logger.exception("Account diagnostic connection failed")
+
         raise HTTPException(
-            502, f"Meta connection error: {type(exc).__name__}"
+            502,
+            f"Meta connection error: {type(exc).__name__}",
         )
 
 
@@ -199,6 +309,7 @@ async def check_account():
 # ==================================================
 
 async def generate_ai_reply(message: str) -> str:
+
     if not groq_client:
         raise RuntimeError("Groq API key missing")
 
@@ -284,13 +395,12 @@ async def send_instagram_dm(
             logger.info("Instagram DM sent successfully")
             return True
 
-        # Meta's response is useful for diagnosing permission/API errors.
-        # Do not log request headers or access tokens.
         logger.error(
             "Instagram send API failed: HTTP %s; response=%s",
             response.status_code,
             response.text[:1000],
         )
+
         return False
 
     except httpx.RequestError as exc:
@@ -310,6 +420,7 @@ async def process_dm(
     sender_id: str,
     message_text: str,
 ):
+
     try:
         logger.info("Generating AI reply")
 
@@ -324,7 +435,9 @@ async def process_dm(
         )
 
         if not sent:
-            logger.error("AI reply could not be sent to Instagram")
+            logger.error(
+                "AI reply could not be sent to Instagram"
+            )
 
     except Exception as exc:
         logger.exception(
@@ -337,36 +450,49 @@ async def process_dm(
 # WEBHOOK EVENT PARSING
 # ==================================================
 
-def extract_messaging_events(entry: dict[str, Any]) -> list:
+def extract_messaging_events(
+    entry: dict[str, Any],
+) -> list[dict[str, Any]]:
+
     events = []
 
     messaging = entry.get("messaging", [])
+
     if isinstance(messaging, list):
         events.extend(
-            item for item in messaging
+            item
+            for item in messaging
             if isinstance(item, dict)
         )
 
     changes = entry.get("changes", [])
+
     if isinstance(changes, list):
+
         for change in changes:
+
             if not isinstance(change, dict):
                 continue
 
-            if change.get("field") not in ("messages", "messaging"):
+            if change.get("field") not in (
+                "messages",
+                "messaging",
+            ):
                 continue
 
             value = change.get("value")
-            if (
-                isinstance(value, dict)
-                and isinstance(value.get("message"), dict)
-            ):
+
+            if not isinstance(value, dict):
+                continue
+
+            if isinstance(value.get("message"), dict):
                 events.append(value)
 
     return events
 
 
 def extract_incoming_message(event: dict):
+
     message = event.get("message")
 
     if not isinstance(message, dict):
@@ -376,6 +502,7 @@ def extract_incoming_message(event: dict):
         return None
 
     sender = event.get("sender") or {}
+
     if not isinstance(sender, dict):
         return None
 
@@ -395,40 +522,15 @@ def extract_incoming_message(event: dict):
 
 
 # ==================================================
-# HOME / HEALTH
+# META WEBHOOK VERIFICATION - GET
 # ==================================================
 
-@app.get("/")
-async def home():
-    return {
-        "project": "PSYCHOMODS AI",
-        "status": "online",
-        "version": "2.1.0",
-    }
-
-
-@app.head("/")
-async def home_head():
-    return PlainTextResponse("", status_code=200)
-
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "healthy",
-        "groq_configured": groq_client is not None,
-        "instagram_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
-        "account_id_configured": bool(INSTAGRAM_ACCOUNT_ID),
-        "api_mode": API_MODE,
-    }
-
-
-# ==================================================
-# META WEBHOOK VERIFICATION (GET)
-# ==================================================
-
-@app.get("/webhook", response_class=PlainTextResponse)
+@app.get(
+    "/webhook",
+    response_class=PlainTextResponse,
+)
 async def verify_webhook(request: Request):
+
     mode = request.query_params.get("hub.mode")
     token = request.query_params.get("hub.verify_token")
     challenge = request.query_params.get("hub.challenge")
@@ -443,11 +545,15 @@ async def verify_webhook(request: Request):
         return PlainTextResponse(challenge or "")
 
     logger.warning("Webhook GET verification rejected")
-    raise HTTPException(403, "Webhook verification failed")
+
+    raise HTTPException(
+        403,
+        "Webhook verification failed",
+    )
 
 
 # ==================================================
-# RECEIVE INSTAGRAM WEBHOOK (POST)
+# RECEIVE INSTAGRAM WEBHOOK - POST
 # ==================================================
 
 @app.post("/webhook")
@@ -455,71 +561,138 @@ async def receive_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
 ):
-    # Read the exact raw body before parsing JSON.
+
+    # IMPORTANT:
+    # Read raw bytes before parsing JSON.
     body = await request.body()
 
-    signature = request.headers.get("X-Hub-Signature-256", "")
+    signature = request.headers.get(
+        "X-Hub-Signature-256",
+        "",
+    )
 
-    if not META_APP_SECRET:
-        logger.error("META_APP_SECRET is not configured")
-        raise HTTPException(503, "Meta App Secret missing")
+    if not get_signature_secrets():
+        logger.error(
+            "No webhook signature secret is configured"
+        )
+
+        raise HTTPException(
+            503,
+            "Webhook signature secret missing",
+        )
 
     if not signature:
         logger.warning(
-            "Webhook signature rejected: signature header is missing"
+            "Webhook signature rejected: header missing"
         )
-        raise HTTPException(401, "Webhook signature header missing")
 
-    if not verify_meta_signature(body, signature):
-        logger.warning(
-            "Webhook signature rejected: signature format or digest "
-            "does not match. Check META_APP_SECRET in Render."
+        raise HTTPException(
+            401,
+            "Webhook signature header missing",
         )
-        raise HTTPException(401, "Invalid webhook signature")
 
-    logger.info("Webhook signature validated successfully")
+    valid, result = verify_meta_signature(
+        body,
+        signature,
+    )
 
+    if not valid:
+
+        if result == "digest_mismatch":
+            logger.warning(
+                "Webhook signature mismatch. "
+                "Configured candidate secrets did not match. "
+                "Body length=%d bytes. "
+                "Check that the webhook belongs to the expected Meta app.",
+                len(body),
+            )
+
+        else:
+            logger.warning(
+                "Webhook signature rejected: %s",
+                result,
+            )
+
+        raise HTTPException(
+            401,
+            "Invalid webhook signature",
+        )
+
+    logger.info(
+        "Webhook signature validated using %s",
+        result,
+    )
+
+    # Parse JSON only after successful signature validation.
     try:
-        payload = await request.json()
-    except Exception:
+        payload = json.loads(body)
+
+    except (ValueError, UnicodeDecodeError):
         logger.warning("Webhook received invalid JSON")
-        raise HTTPException(400, "Invalid JSON")
+
+        raise HTTPException(
+            400,
+            "Invalid JSON",
+        )
 
     if not isinstance(payload, dict):
-        raise HTTPException(400, "Invalid payload")
+        raise HTTPException(
+            400,
+            "Invalid payload",
+        )
 
     if payload.get("object") != "instagram":
-        logger.info("Ignoring webhook object: %s", payload.get("object"))
-        return {"status": "ignored"}
+        logger.info(
+            "Ignoring webhook object: %s",
+            payload.get("object"),
+        )
+
+        return {
+            "status": "ignored",
+        }
 
     entries = payload.get("entry", [])
+
     if not isinstance(entries, list):
-        return {"status": "received"}
+        return {
+            "status": "received",
+            "scheduled": 0,
+        }
 
     scheduled = 0
     skipped = 0
 
     for entry in entries:
+
         if not isinstance(entry, dict):
             continue
 
-        webhook_account_id = str(entry.get("id", "")).strip()
+        webhook_account_id = str(
+            entry.get("id", "")
+        ).strip()
 
         account_id = (
             INSTAGRAM_ACCOUNT_ID
-            if INSTAGRAM_ACCOUNT_ID
-            else webhook_account_id
+            or webhook_account_id
         )
 
         if not account_id or account_id == "0":
-            logger.error("Invalid Instagram account ID in webhook")
+            logger.error(
+                "Invalid Instagram account ID in webhook"
+            )
+
             skipped += 1
             continue
 
         events = extract_messaging_events(entry)
-        logger.info("Messaging events discovered: %d", len(events))
+
+        logger.info(
+            "Messaging events discovered: %d",
+            len(events),
+        )
 
         for event in events:
+
             result = extract_incoming_message(event)
 
             if result is None:
@@ -537,12 +710,17 @@ async def receive_webhook(
                 skipped += 1
                 continue
 
+            logger.info(
+                "Incoming Instagram message received"
+            )
+
             background_tasks.add_task(
                 process_dm,
                 account_id,
                 sender_id,
                 message_text,
             )
+
             scheduled += 1
 
     logger.info(
@@ -564,19 +742,41 @@ async def receive_webhook(
 
 @app.on_event("startup")
 async def startup():
+
     logger.info("PSYCHOMODS AI starting")
+    logger.info("Version: 2.2.0")
     logger.info("API mode: %s", API_MODE)
     logger.info("API host: %s", META_GRAPH_BASE_URL)
+
     logger.info(
         "Account ID configured: %s",
         bool(INSTAGRAM_ACCOUNT_ID),
     )
+
     logger.info(
         "Instagram access token configured: %s",
         bool(INSTAGRAM_ACCESS_TOKEN),
     )
-    logger.info("Meta App Secret configured: %s", bool(META_APP_SECRET))
-    logger.info("Groq configured: %s", bool(groq_client))
+
+    logger.info(
+        "Meta App Secret configured: %s",
+        bool(META_APP_SECRET),
+    )
+
+    logger.info(
+        "Instagram App Secret configured: %s",
+        bool(INSTAGRAM_APP_SECRET),
+    )
+
+    logger.info(
+        "Groq configured: %s",
+        bool(groq_client),
+    )
+
+    logger.info(
+        "Signature secret candidates: %d",
+        len(get_signature_secrets()),
+    )
 
 
 if __name__ == "__main__":
