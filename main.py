@@ -27,7 +27,7 @@ logger = logging.getLogger("psychomods_ai")
 
 
 def clean_env(name: str) -> str:
-    """Read an environment variable without accidental surrounding quotes."""
+    """Read environment variables without surrounding quotes."""
     value = os.getenv(name, "").strip()
 
     if len(value) >= 2:
@@ -38,14 +38,8 @@ def clean_env(name: str) -> str:
 
 
 VERIFY_TOKEN = clean_env("VERIFY_TOKEN")
-
-# Main Meta App Secret.
 META_APP_SECRET = clean_env("META_APP_SECRET")
-
-# Optional additional secret, only if Meta provides a separate
-# Instagram-specific secret for your integration.
 INSTAGRAM_APP_SECRET = clean_env("INSTAGRAM_APP_SECRET")
-
 INSTAGRAM_ACCESS_TOKEN = clean_env("INSTAGRAM_ACCESS_TOKEN")
 
 GROQ_API_KEY = clean_env("GROQ_API_KEY")
@@ -85,7 +79,7 @@ groq_client = (
 app = FastAPI(
     title="PSYCHOMODS AI",
     description="AI-powered Instagram DM assistant",
-    version="2.2.0",
+    version="2.3.0",
 )
 
 
@@ -123,24 +117,17 @@ def remember_message(message_id: str) -> bool:
 def get_signature_secrets() -> list[tuple[str, str]]:
     """
     Return configured candidate secrets.
-
-    The secret name is included for safe diagnostics.
     Secret values are never logged or returned.
     """
 
     candidates = []
 
     if META_APP_SECRET:
-        candidates.append(
-            ("META_APP_SECRET", META_APP_SECRET)
-        )
+        candidates.append(("META_APP_SECRET", META_APP_SECRET))
 
     if INSTAGRAM_APP_SECRET:
-        candidates.append(
-            ("INSTAGRAM_APP_SECRET", INSTAGRAM_APP_SECRET)
-        )
+        candidates.append(("INSTAGRAM_APP_SECRET", INSTAGRAM_APP_SECRET))
 
-    # Avoid checking the same value twice.
     unique = []
     seen = set()
 
@@ -158,9 +145,7 @@ def verify_meta_signature(
 ) -> tuple[bool, str]:
     """
     Verify Meta's X-Hub-Signature-256 header.
-
-    HMAC-SHA256 is calculated over the exact raw request bytes.
-    No JSON parsing or body modification happens before validation.
+    Uses the exact original request body bytes.
     """
 
     if not signature:
@@ -182,7 +167,6 @@ def verify_meta_signature(
         return False, "no_secret_configured"
 
     for secret_name, secret_value in secrets:
-
         expected_digest = hmac.new(
             secret_value.encode("utf-8"),
             body,
@@ -207,7 +191,7 @@ async def home():
     return {
         "project": "PSYCHOMODS AI",
         "status": "online",
-        "version": "2.2.0",
+        "version": "2.3.0",
     }
 
 
@@ -220,7 +204,7 @@ async def home_head():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "groq_configured": groq_client is not None,
         "instagram_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
         "account_id_configured": bool(INSTAGRAM_ACCOUNT_ID),
@@ -232,7 +216,7 @@ async def health():
 async def diagnostics():
     return {
         "project": "PSYCHOMODS AI",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "configured_mode": API_MODE,
         "configured_host": META_GRAPH_BASE_URL,
         "graph_version": GRAPH_API_VERSION,
@@ -251,16 +235,10 @@ async def diagnostics():
 async def check_account():
 
     if not INSTAGRAM_ACCESS_TOKEN:
-        raise HTTPException(
-            503,
-            "Instagram access token missing",
-        )
+        raise HTTPException(503, "Instagram access token missing")
 
     if not INSTAGRAM_ACCOUNT_ID or INSTAGRAM_ACCOUNT_ID == "0":
-        raise HTTPException(
-            400,
-            "Valid Instagram account ID missing",
-        )
+        raise HTTPException(400, "Valid Instagram account ID missing")
 
     url = (
         f"{META_GRAPH_BASE_URL}/"
@@ -274,18 +252,14 @@ async def check_account():
                 url,
                 params={"fields": "id,username"},
                 headers={
-                    "Authorization": (
-                        f"Bearer {INSTAGRAM_ACCESS_TOKEN}"
-                    )
+                    "Authorization": f"Bearer {INSTAGRAM_ACCESS_TOKEN}"
                 },
             )
 
         try:
             data = response.json()
         except ValueError:
-            data = {
-                "error": "Meta returned a non-JSON response"
-            }
+            data = {"error": "Meta returned a non-JSON response"}
 
         return {
             "configured_account_id": INSTAGRAM_ACCOUNT_ID,
@@ -435,9 +409,7 @@ async def process_dm(
         )
 
         if not sent:
-            logger.error(
-                "AI reply could not be sent to Instagram"
-            )
+            logger.error("AI reply could not be sent to Instagram")
 
     except Exception as exc:
         logger.exception(
@@ -468,16 +440,12 @@ def extract_messaging_events(
     changes = entry.get("changes", [])
 
     if isinstance(changes, list):
-
         for change in changes:
 
             if not isinstance(change, dict):
                 continue
 
-            if change.get("field") not in (
-                "messages",
-                "messaging",
-            ):
+            if change.get("field") not in ("messages", "messaging"):
                 continue
 
             value = change.get("value")
@@ -491,7 +459,7 @@ def extract_messaging_events(
     return events
 
 
-def extract_incoming_message(event: dict):
+def extract_incoming_message(event: dict[str, Any]):
 
     message = event.get("message")
 
@@ -546,10 +514,7 @@ async def verify_webhook(request: Request):
 
     logger.warning("Webhook GET verification rejected")
 
-    raise HTTPException(
-        403,
-        "Webhook verification failed",
-    )
+    raise HTTPException(403, "Webhook verification failed")
 
 
 # ==================================================
@@ -562,8 +527,7 @@ async def receive_webhook(
     background_tasks: BackgroundTasks,
 ):
 
-    # IMPORTANT:
-    # Read raw bytes before parsing JSON.
+    # Read the exact original body before parsing JSON.
     body = await request.body()
 
     signature = request.headers.get(
@@ -572,46 +536,43 @@ async def receive_webhook(
     )
 
     if not get_signature_secrets():
-        logger.error(
-            "No webhook signature secret is configured"
-        )
-
+        logger.error("No webhook signature secret is configured")
         raise HTTPException(
             503,
             "Webhook signature secret missing",
         )
 
     if not signature:
-        logger.warning(
-            "Webhook signature rejected: header missing"
-        )
-
+        logger.warning("Webhook signature rejected: header missing")
         raise HTTPException(
             401,
             "Webhook signature header missing",
         )
 
-    valid, result = verify_meta_signature(
-        body,
-        signature,
-    )
+    valid, result = verify_meta_signature(body, signature)
+
+    # ==================================================
+    # SAFE SIGNATURE DIAGNOSTICS
+    # ==================================================
 
     if not valid:
-
-        if result == "digest_mismatch":
-            logger.warning(
-                "Webhook signature mismatch. "
-                "Configured candidate secrets did not match. "
-                "Body length=%d bytes. "
-                "Check that the webhook belongs to the expected Meta app.",
-                len(body),
-            )
-
-        else:
-            logger.warning(
-                "Webhook signature rejected: %s",
-                result,
-            )
+        logger.warning(
+            "WEBHOOK SIGNATURE DIAGNOSTICS | "
+            "reason=%s | "
+            "header_present=%s | "
+            "header_length=%d | "
+            "header_prefix=%s | "
+            "content_type=%s | "
+            "body_length=%d | "
+            "body_sha256=%s",
+            result,
+            bool(signature),
+            len(signature),
+            signature.split("=", 1)[0] if "=" in signature else "invalid",
+            request.headers.get("content-type", "missing"),
+            len(body),
+            hashlib.sha256(body).hexdigest()[:16],
+        )
 
         raise HTTPException(
             401,
@@ -623,33 +584,23 @@ async def receive_webhook(
         result,
     )
 
-    # Parse JSON only after successful signature validation.
+    # Parse JSON only after signature validation.
     try:
         payload = json.loads(body)
 
     except (ValueError, UnicodeDecodeError):
         logger.warning("Webhook received invalid JSON")
-
-        raise HTTPException(
-            400,
-            "Invalid JSON",
-        )
+        raise HTTPException(400, "Invalid JSON")
 
     if not isinstance(payload, dict):
-        raise HTTPException(
-            400,
-            "Invalid payload",
-        )
+        raise HTTPException(400, "Invalid payload")
 
     if payload.get("object") != "instagram":
         logger.info(
             "Ignoring webhook object: %s",
             payload.get("object"),
         )
-
-        return {
-            "status": "ignored",
-        }
+        return {"status": "ignored"}
 
     entries = payload.get("entry", [])
 
@@ -677,10 +628,7 @@ async def receive_webhook(
         )
 
         if not account_id or account_id == "0":
-            logger.error(
-                "Invalid Instagram account ID in webhook"
-            )
-
+            logger.error("Invalid Instagram account ID in webhook")
             skipped += 1
             continue
 
@@ -693,13 +641,13 @@ async def receive_webhook(
 
         for event in events:
 
-            result = extract_incoming_message(event)
+            message_result = extract_incoming_message(event)
 
-            if result is None:
+            if message_result is None:
                 skipped += 1
                 continue
 
-            sender_id, message_id, message_text = result
+            sender_id, message_id, message_text = message_result
 
             if sender_id == account_id:
                 skipped += 1
@@ -710,9 +658,7 @@ async def receive_webhook(
                 skipped += 1
                 continue
 
-            logger.info(
-                "Incoming Instagram message received"
-            )
+            logger.info("Incoming Instagram message received")
 
             background_tasks.add_task(
                 process_dm,
@@ -744,7 +690,7 @@ async def receive_webhook(
 async def startup():
 
     logger.info("PSYCHOMODS AI starting")
-    logger.info("Version: 2.2.0")
+    logger.info("Version: 2.3.0")
     logger.info("API mode: %s", API_MODE)
     logger.info("API host: %s", META_GRAPH_BASE_URL)
 
