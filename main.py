@@ -1,4 +1,3 @@
-
 import hashlib
 import hmac
 import json
@@ -6,6 +5,7 @@ import logging
 import os
 import re
 from collections import deque
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
@@ -25,6 +25,8 @@ logging.basicConfig(
 
 logger = logging.getLogger("psychomods_ai")
 
+VERSION = "2.4.0"
+
 
 def clean_env(name: str) -> str:
     value = os.getenv(name, "").strip()
@@ -43,6 +45,8 @@ INSTAGRAM_ACCESS_TOKEN = clean_env("INSTAGRAM_ACCESS_TOKEN")
 
 GROQ_API_KEY = clean_env("GROQ_API_KEY")
 GROQ_MODEL = clean_env("GROQ_MODEL") or "openai/gpt-oss-20b"
+GROQ_REASONING_EFFORT = clean_env("GROQ_REASONING_EFFORT") or "low"
+GROQ_MAX_TOKENS = int(clean_env("GROQ_MAX_TOKENS") or "800")
 
 GRAPH_API_VERSION = clean_env("GRAPH_API_VERSION") or "v27.0"
 
@@ -75,10 +79,40 @@ groq_client = (
     else None
 )
 
+
+# ==================================================
+# STARTUP (lifespan replaces deprecated on_event)
+# ==================================================
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    logger.info("PSYCHOMODS AI starting")
+    logger.info("Version: %s", VERSION)
+    logger.info("API mode: %s", API_MODE)
+    logger.info("API host: %s", META_GRAPH_BASE_URL)
+    logger.info("Account ID configured: %s", bool(INSTAGRAM_ACCOUNT_ID))
+    logger.info(
+        "Instagram access token configured: %s",
+        bool(INSTAGRAM_ACCESS_TOKEN),
+    )
+    logger.info("Meta App Secret configured: %s", bool(META_APP_SECRET))
+    logger.info(
+        "Instagram App Secret configured: %s",
+        bool(INSTAGRAM_APP_SECRET),
+    )
+    logger.info("Groq configured: %s", bool(groq_client))
+    logger.info(
+        "Signature secret candidates: %d",
+        len(get_signature_secrets()),
+    )
+    yield
+
+
 app = FastAPI(
     title="PSYCHOMODS AI",
     description="AI-powered Instagram DM assistant",
-    version="2.3.1",
+    version=VERSION,
+    lifespan=lifespan,
 )
 
 
@@ -107,6 +141,16 @@ def remember_message(message_id: str) -> bool:
         seen_message_ids.discard(old_id)
 
     return True
+
+
+def forget_message(message_id: str) -> None:
+    """Allow a message to be processed again (used after a failed send)."""
+    seen_message_ids.discard(message_id)
+
+    try:
+        recent_message_ids.remove(message_id)
+    except ValueError:
+        pass
 
 
 # ==================================================
@@ -181,7 +225,7 @@ async def home():
     return {
         "project": "PSYCHOMODS AI",
         "status": "online",
-        "version": "2.3.1",
+        "version": VERSION,
     }
 
 
@@ -194,7 +238,7 @@ async def home_head():
 async def health():
     return {
         "status": "healthy",
-        "version": "2.3.1",
+        "version": VERSION,
         "groq_configured": groq_client is not None,
         "instagram_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
         "account_id_configured": bool(INSTAGRAM_ACCOUNT_ID),
@@ -206,12 +250,13 @@ async def health():
 async def diagnostics():
     return {
         "project": "PSYCHOMODS AI",
-        "version": "2.3.1",
+        "version": VERSION,
         "configured_mode": API_MODE,
         "configured_host": META_GRAPH_BASE_URL,
         "graph_version": GRAPH_API_VERSION,
         "access_token_configured": bool(INSTAGRAM_ACCESS_TOKEN),
         "groq_configured": groq_client is not None,
+        "groq_model": GROQ_MODEL,
         "meta_app_secret_configured": bool(META_APP_SECRET),
         "instagram_app_secret_configured": bool(INSTAGRAM_APP_SECRET),
         "signature_secret_count": len(get_signature_secrets()),
@@ -298,7 +343,9 @@ async def generate_ai_reply(message: str) -> str:
             },
         ],
         temperature=0.5,
-        max_completion_tokens=220,
+        # Reasoning tokens count toward this limit, so keep it generous
+        max_completion_tokens=GROQ_MAX_TOKENS,
+        reasoning_effort=GROQ_REASONING_EFFORT,
     )
 
     reply = completion.choices[0].message.content
@@ -383,6 +430,7 @@ async def process_dm(
     account_id: str,
     sender_id: str,
     message_text: str,
+    message_id: str,
 ):
 
     try:
@@ -400,12 +448,14 @@ async def process_dm(
 
         if not sent:
             logger.error("AI reply could not be sent to Instagram")
+            forget_message(message_id)
 
     except Exception as exc:
         logger.exception(
             "DM processing failed: %s",
             type(exc).__name__,
         )
+        forget_message(message_id)
 
 
 # ==================================================
@@ -665,6 +715,7 @@ async def receive_webhook(
                 account_id,
                 sender_id,
                 message_text,
+                message_id,
             )
 
             scheduled += 1
@@ -680,49 +731,6 @@ async def receive_webhook(
         "scheduled": scheduled,
         "skipped": skipped,
     }
-
-
-# ==================================================
-# STARTUP
-# ==================================================
-
-@app.on_event("startup")
-async def startup():
-
-    logger.info("PSYCHOMODS AI starting")
-    logger.info("Version: 2.3.1")
-    logger.info("API mode: %s", API_MODE)
-    logger.info("API host: %s", META_GRAPH_BASE_URL)
-
-    logger.info(
-        "Account ID configured: %s",
-        bool(INSTAGRAM_ACCOUNT_ID),
-    )
-
-    logger.info(
-        "Instagram access token configured: %s",
-        bool(INSTAGRAM_ACCESS_TOKEN),
-    )
-
-    logger.info(
-        "Meta App Secret configured: %s",
-        bool(META_APP_SECRET),
-    )
-
-    logger.info(
-        "Instagram App Secret configured: %s",
-        bool(INSTAGRAM_APP_SECRET),
-    )
-
-    logger.info(
-        "Groq configured: %s",
-        bool(groq_client),
-    )
-
-    logger.info(
-        "Signature secret candidates: %d",
-        len(get_signature_secrets()),
-    )
 
 
 if __name__ == "__main__":
