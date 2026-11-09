@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.responses import PlainTextResponse
 from groq import AsyncGroq
 
@@ -138,6 +138,110 @@ groq_client = (
 )
 
 http_client: httpx.AsyncClient | None = None
+
+
+# ============================================================
+# PRIVACY POLICY
+# ============================================================
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_policy():
+    return HTMLResponse(
+        content="""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy | PSYCHOMODS AI</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 32px 18px;
+      background: #080a09;
+      color: #e9eee9;
+      font: 16px/1.7 system-ui, sans-serif;
+    }
+    main {
+      max-width: 820px;
+      margin: 0 auto;
+      padding: 28px;
+      background: #111512;
+      border: 1px solid #29342c;
+      border-radius: 16px;
+    }
+    h1, h2 { color: #b7ff00; }
+    a { color: #b7ff00; }
+    .muted { color: #aab5ac; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Privacy Policy</h1>
+  <p class="muted">PSYCHOMODS AI · Last updated: 9 November 2026</p>
+
+  <p>PSYCHOMODS AI is an Instagram messaging assistant operated by
+  Psycho Mod's | Tech Lab. This policy explains what information is
+  processed when you interact with the assistant through Instagram
+  Direct Messages.</p>
+
+  <h2>1. Information we process</h2>
+  <p>When you send a message to the connected Instagram account, the
+  service may process your message text, Instagram sender and recipient
+  identifiers, message identifiers, and timestamps supplied by Meta.
+  This information is used to receive your message, generate a response,
+  prevent duplicate processing, and send a reply.</p>
+
+  <h2>2. How information is used</h2>
+  <p>Message text may be sent to Groq to generate an AI-assisted response.
+  The response is then sent through Meta's Instagram messaging API.
+  We do not ask you to provide passwords, access tokens, or payment-card
+  details in Instagram messages.</p>
+
+  <h2>3. Service providers</h2>
+  <p>The service relies on Meta/Instagram to deliver and send messages,
+  Groq to generate AI responses, and Render to host the application.
+  These providers may process information under their own terms and
+  privacy policies.</p>
+
+  <h2>4. Storage and retention</h2>
+  <p>The application keeps a temporary in-memory record of recently
+  processed message identifiers to avoid replying more than once to
+  the same message. The current application code does not save message
+  text to a persistent application database. Hosting and provider
+  systems may maintain operational logs under their own retention
+  policies.</p>
+
+  <h2>5. Sharing</h2>
+  <p>We do not sell your personal information. Information is shared
+  with the service providers described above as needed to operate the
+  assistant, or when required by law.</p>
+
+  <h2>6. Your choices and requests</h2>
+  <p>You can stop interacting with the assistant at any time by no
+  longer messaging the Instagram account. To ask a question about this
+  policy or request deletion of information under our control, contact
+  <a href="mailto:ashwinjm2005@gmail.com">ashwinjm2005@gmail.com</a>.
+  Please do not email passwords or access tokens.</p>
+
+  <h2>7. Children's privacy</h2>
+  <p>This service is not intended for children under 13.</p>
+
+  <h2>8. Security</h2>
+  <p>We use reasonable technical measures to protect configuration
+  and message processing. No internet service can guarantee absolute
+  security.</p>
+
+  <h2>9. Changes to this policy</h2>
+  <p>We may update this policy when the service or its data practices
+  change. The latest version will be published at this URL.</p>
+
+  <h2>10. Contact</h2>
+  <p>For privacy questions, contact
+  <a href="mailto:ashwinjm2005@gmail.com">ashwinjm2005@gmail.com</a>.</p>
+</main>
+</body>
+</html>"""
+    )
 
 
 # ============================================================
